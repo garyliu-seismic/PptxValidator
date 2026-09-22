@@ -1,6 +1,6 @@
 # PptxValidator
 
-A Python wrapper around Seismic's internal `PptxValidatorNet8.exe` (.NET
+A Python wrapper around `PptxValidatorNet8.exe` (.NET
 8/10) for diagnosing and
 partially auto-fixing broken `.pptx`/`.docx`/`.xlsx` files.
 
