@@ -25,7 +25,7 @@ tradeoff — see `SKILL.md` for the full rationale.
 - A build of `PptxValidatorNet8.exe` (Release, net10.0). By default the
   scripts look for it at:
   ```
-  Release\net10.0\PptxValidatorNet8.exe
+  .\bin\PptxValidatorNet8.exe
   ```
   Pass `--exe <path>` to override.
 - Python 3.10+, stdlib only (`zipfile`, `xml.etree.ElementTree`, `subprocess`,
