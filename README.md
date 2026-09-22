@@ -80,4 +80,4 @@ scripts/autofix.py    fix: diagnose then repair structural issues only
 
 ## License
 
-Internal Seismic tooling; no license file included — do not distribute outside the org.
+no license file included
