@@ -1,7 +1,7 @@
 # PptxValidator
 
 A Python wrapper around Seismic's internal `PptxValidatorNet8.exe` (.NET
-8/10, built from `app-livedoc-construction-engine`) for diagnosing and
+8/10) for diagnosing and
 partially auto-fixing broken `.pptx`/`.docx`/`.xlsx` files.
 
 It also ships as a Claude Code skill (`SKILL.md`) so Claude can validate and
@@ -25,7 +25,7 @@ tradeoff — see `SKILL.md` for the full rationale.
 - A build of `PptxValidatorNet8.exe` (Release, net10.0). By default the
   scripts look for it at:
   ```
-  C:\project_new\app-livedoc-construction-engine\src\core\PptxValidatorToolNet8\bin\Release\net10.0\PptxValidatorNet8.exe
+  Release\net10.0\PptxValidatorNet8.exe
   ```
   Pass `--exe <path>` to override.
 - Python 3.10+, stdlib only (`zipfile`, `xml.etree.ElementTree`, `subprocess`,
