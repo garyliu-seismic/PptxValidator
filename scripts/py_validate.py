@@ -75,9 +75,37 @@ _IGNORED_VALIDATION_ERRORS = ["hyphenationZone", "purl.org/dc/terms"]
 #   buSzPct: ISO XSD requires "%"-suffix pattern (e.g. "80%") but Office
 #            stores integer thousandths (e.g. 80000). The .NET SDK accepts
 #            both forms internally; we suppress the pattern-facet failure.
+# lxml produces "No matching global declaration" for ms-proprietary root elements
+# that have no ISO-29500-4 XSD.  These are false-positives — .NET SDK has
+# built-in schemas for them and reports nothing (or only Low-severity findings).
+_IGNORED_ROOT_NS_PREFIXES = (
+    "http://schemas.microsoft.com/office/webextensions/",   # Office Add-in taskpanes/webextension
+    "http://schemas.microsoft.com/office/drawing/2012/chartStyle",  # chartStyle / colorStyle
+    "http://schemas.microsoft.com/office/powerpoint/2018/8/main",   # authorLst
+    "http://schemas.microsoft.com/office/powerpoint/2015/10/main",  # revInfo
+)
+
 _IGNORED_ERROR_SUBSTRINGS = [
-    "buSzPct", # catches all buSzPct pattern/value errors
+    "buSzPct",  # ISO XSD requires "80%" pattern; Office stores 80000 integer
 ]
+
+# .NET SDK treats these ms-extension child elements as Low-severity
+# "unexpected child" warnings (they live in c:ext / mc:AlternateContent).
+# lxml strict-validates and reports them as errors; suppress to match .NET.
+_LOW_EXTENSION_CHILD_PATTERNS = (
+    "office/drawing/2017/03/chart:dataDisplayOptions16",
+    "office/drawing/2012/chart:leaderLines",
+    "office/drawing/2012/chart:showDataLabelsRange",
+    "office/drawing/2014/chartex:",
+)
+
+# .NET reports these as Low ("attribute is not declared") — same for Python.
+# lxml message differs slightly; normalise here.
+_UNDECLARED_ATTR_SUBSTRINGS = (
+    "attribute 'UID': The attribute 'UID' is not allowed",
+    "attribute 'uri': The attribute 'uri' is not allowed",
+    "attribute 'val': The attribute 'val' is not allowed",
+)
 
 # Parts whose root element belongs to a Microsoft-proprietary or application-
 # specific namespace with no matching ISO-29500-4 XSD.
@@ -88,13 +116,14 @@ _IGNORED_ERROR_SUBSTRINGS = [
 # customXml/item*.xml        — application-custom XML (Seismic/Word SDT store);
 #     no standard XSD; .NET SDK skips schema validation for these entirely.
 _SKIP_PART_PATTERNS = [
-    # customXml/item*.xml: app-specific XML with no OOXML XSD; .NET skips schema validation
-    re.compile(r"customXml/item\d+\.xml$", re.IGNORECASE),
-    # customXml/itemProps*.xml: datastoreItem schema (oc-customXmlDataProperties.xsd)
-    # root is {officeDocument/2006/customXml}datastoreItem — causes false-positive
-    re.compile(r"customXml/itemProps\d+\.xml$", re.IGNORECASE),
-    # NOTE: ppt/diagrams/drawing*.xml is NOT skipped here — it's handled by
-    # _validate_diagrams_drawing() below which does targeted MinInclusive checks.
+    re.compile(r"customXml/item\d+\.xml$",      re.IGNORECASE),  # app-custom XML
+    re.compile(r"customXml/itemProps\d+\.xml$", re.IGNORECASE),  # datastoreItem
+    # Office Add-in parts: webExtensions/*.xml — ms-proprietary, no ISO XSD
+    re.compile(r"webExtensions/",               re.IGNORECASE),
+    # chart style parts: ms/office/drawing/2012/chartStyle — no ISO XSD
+    re.compile(r"charts/style\d*\.xml$",        re.IGNORECASE),
+    re.compile(r"charts/colors\d*\.xml$",       re.IGNORECASE),
+    # NOTE: ppt/diagrams/drawing*.xml is handled by _validate_diagrams_drawing()
 ]
 
 # Parts that have a dedicated XSD different from their parent-folder default.
@@ -484,14 +513,27 @@ def _validate_part_xsd(rel_path: str, data: bytes,
         findings = []
         for err in schema.error_log:
             msg = err.message
+            # 1. known cross-namespace XSD load issues
             if any(ign in msg for ign in _IGNORED_VALIDATION_ERRORS):
                 continue
-            # Gap fix #4: buSzPct integer format — .NET SDK accepts 80000, ISO XSD requires "80%"
+            # 2. false-positives: buSzPct integer format, etc.
             if any(sub in msg for sub in _IGNORED_ERROR_SUBSTRINGS):
                 continue
+            # 3. ms-proprietary root element — "No matching global declaration"
+            #    for roots in ms-private namespaces (webextension, chartStyle, etc.)
+            if "No matching global declaration" in msg:
+                if any(ns in msg for ns in _IGNORED_ROOT_NS_PREFIXES):
+                    continue
+            # 4. ms-extension child elements inside c:ext / mc:AlternateContent
+            #    — .NET reports as Low or ignores; lxml reports as error
+            if any(pat in msg for pat in _LOW_EXTENSION_CHILD_PATTERNS):
+                continue
+            # 5. "UID"/"uri"/"val" attribute lxml phrasing — normalise to Low
+            #    (same as .NET "is not declared" -> Low)
+            is_undeclared_attr = any(sub in msg for sub in _UNDECLARED_ATTR_SUBSTRINGS)
             xpath = f"line:{err.line}"
             hint  = get_root_cause_hint(msg, xpath)
-            sev   = get_severity(msg, xpath)
+            sev   = "Low" if is_undeclared_attr else get_severity(msg, xpath)
             findings.append({
                 "partUri":     f"/{rel_path}",
                 "xPath":       xpath,
@@ -567,6 +609,242 @@ def _validate_diagrams_drawing(rel_path: str, data: bytes) -> list[dict]:
                         })
                 except ValueError:
                     pass
+    return findings
+
+
+def _check_chart_part(rel_path: str, data: bytes) -> list[dict]:
+    """Targeted scan of chart XML for errors .NET SDK catches but lxml XSD misses.
+
+    Does NOT run full XSD validation (dml-chart.xsd produces too many ms-extension
+    false-positives). Instead checks specific known patterns:
+      - 'uri' attribute not declared on non-standard elements
+      - 'val' attribute not declared on chartex elements
+      - binSize empty value (chartex:binSize)
+      - dataDisplayOptions16 invalid child
+      - leaderLines / showDataLabelsRange / showDLblsOverMax unexpected children
+      - negative axId values (UInt32 violation)
+    """
+    _CHART_NS   = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+    _CHARTEX_NS = "http://schemas.microsoft.com/office/drawing/2014/chartex"
+    _C14_NS     = "http://schemas.microsoft.com/office/drawing/2017/03/chart"
+    _C15_NS     = "http://schemas.microsoft.com/office/drawing/2012/chart"
+
+    findings: list[dict] = []
+    try:
+        root = lxml.etree.fromstring(data)
+    except Exception:
+        return findings
+
+    part = f"/{rel_path}"
+
+    for el in root.iter():
+        tag = el.tag if isinstance(el.tag, str) else ""
+        ns  = tag.split("}")[0][1:] if "}" in tag else ""
+        local = tag.split("}")[-1] if "}" in tag else tag
+        line = getattr(el, "sourceline", "?")
+
+        # uri attribute on c:ext — not declared in schema (Low)
+        if local == "ext" and ns == _CHART_NS:
+            if el.get("uri") is not None:
+                findings.append({
+                    "partUri": part, "xPath": f"line:{line}",
+                    "description": "The 'uri' attribute is not declared.",
+                    "errorType": "InvalidAttribute", "severity": "Low",
+                    "hint": "c:ext @uri is an extension discriminator; not in ISO schema but valid in practice.",
+                    "nodeLocalName": "ext", "nodeXml": None,
+                })
+
+        # chartex:binSize empty value
+        if ns == _CHARTEX_NS and local == "binSize":
+            val = el.get("val", "")
+            if val == "" or val is None:
+                findings.append({
+                    "partUri": part, "xPath": f"line:{line}",
+                    "description": (f"The element '{{{_CHARTEX_NS}}}binSize' has invalid value ''. "
+                                    "The text value cannot be empty."),
+                    "errorType": "InvalidValue", "severity": "High",
+                    "hint": "chartex:binSize @val must be a non-empty numeric string.",
+                    "nodeLocalName": "binSize", "nodeXml": None,
+                })
+            # val attribute not declared on chartex elements (Low)
+            if el.get("val") is not None and val != "":
+                findings.append({
+                    "partUri": part, "xPath": f"line:{line}",
+                    "description": "The 'val' attribute is not declared.",
+                    "errorType": "InvalidAttribute", "severity": "Low",
+                    "hint": "chartex @val is a Microsoft extension attribute; not in ISO schema.",
+                    "nodeLocalName": local, "nodeXml": None,
+                })
+
+        # dataDisplayOptions16 invalid child (Medium)
+        if ns == _C14_NS and local == "dataDisplayOptions16":
+            parent = root.find(f".//{{{_CHART_NS}}}ext/..")
+            findings.append({
+                "partUri": part, "xPath": f"line:{line}",
+                "description": (f"The element has invalid child element "
+                                f"'{{{_C14_NS}}}dataDisplayOptions16'. "
+                                "List of possible elements expected: ..."),
+                "errorType": "InvalidChild", "severity": "Low",
+                "hint": "Office 2017+ chart extension inside c:ext; ignored by Office 2013.",
+                "nodeLocalName": local, "nodeXml": None,
+            })
+
+        # leaderLines unexpected child (Low)
+        if ns == _C15_NS and local in ("leaderLines", "showDataLabelsRange"):
+            findings.append({
+                "partUri": part, "xPath": f"line:{line}",
+                "description": (f"The element has unexpected child element "
+                                f"'{{{_C15_NS}}}{local}'."),
+                "errorType": "InvalidChild", "severity": "Low",
+                "hint": f"Office 2012+ chart extension {local}; ignored by Office 2010.",
+                "nodeLocalName": local, "nodeXml": None,
+            })
+
+        # showDLblsOverMax unexpected child (Low)
+        if ns == _CHART_NS and local == "showDLblsOverMax":
+            findings.append({
+                "partUri": part, "xPath": f"line:{line}",
+                "description": (f"The element has unexpected child element "
+                                f"'{{{_CHART_NS}}}showDLblsOverMax'."),
+                "errorType": "InvalidChild", "severity": "Low",
+                "hint": "showDLblsOverMax is a newer chart child element not in the 2013 schema.",
+                "nodeLocalName": local, "nodeXml": None,
+            })
+
+    return findings
+
+
+def _docx_custom_checks(entries: dict[str, bytes]) -> list[dict]:
+    """Ported from C# ValidateDocx() — custom Word structural rules beyond XSD.
+
+    Checks:
+      1. <w:tc> must end with <w:p> (OOXML requirement, causes Word repair dialog)
+      2. Orphaned <w:bookmarkStart> with no matching <w:bookmarkEnd>
+      3. PlaceholderText run style leaked into output
+    """
+    findings: list[dict] = []
+    doc_data = next(
+        (data for name, data in entries.items()
+         if name.lower() == "word/document.xml"), None)
+    if doc_data is None:
+        return findings
+
+    try:
+        root = lxml.etree.fromstring(doc_data)
+    except Exception:
+        return findings
+
+    W = f"{{{_NS_W}}}"
+
+    # 1. <w:tc> last child must be <w:p>
+    for tc in root.iter(f"{W}tc"):
+        children = [c for c in tc if callable(getattr(c, "tag", None)) is False]
+        if children and children[-1].tag != f"{W}p":
+            xml_snippet = lxml.etree.tostring(tc, encoding="unicode")[:300]
+            findings.append({
+                "partUri":       "/word/document.xml",
+                "xPath":         "(see nodeXml)",
+                "description":   "Table cell (<w:tc>) does not end with <w:p>. "
+                                 "OOXML requires every cell to have a paragraph as its last child.",
+                "errorType":     "Structural",
+                "severity":      "Critical",
+                "hint":          "Empty or table-only cell — add a trailing <w:p>. "
+                                 "Often caused by SDT unwrapping leaving a nested table with no paragraph.",
+                "nodeLocalName": "tc",
+                "nodeXml":       xml_snippet,
+            })
+
+    # 2. Orphaned <w:bookmarkStart>
+    end_ids = {
+        el.get(f"{W}id")
+        for el in root.iter(f"{W}bookmarkEnd")
+        if el.get(f"{W}id") is not None
+    }
+    for bs in root.iter(f"{W}bookmarkStart"):
+        bid = bs.get(f"{W}id")
+        if bid and bid not in end_ids:
+            findings.append({
+                "partUri":       "/word/document.xml",
+                "xPath":         "(see nodeXml)",
+                "description":   f"Orphaned <w:bookmarkStart> id=\"{bid}\" "
+                                 f"name=\"{bs.get(f'{W}name', '')}\" has no matching <w:bookmarkEnd>.",
+                "errorType":     "Structural",
+                "severity":      "Critical",
+                "hint":          "Bookmark without End triggers Word repair. "
+                                 "Often caused by bookmarkEnd inside a removed SDT/customXml branch.",
+                "nodeLocalName": "bookmarkStart",
+                "nodeXml":       lxml.etree.tostring(bs, encoding="unicode"),
+            })
+
+    # 3. PlaceholderText leak
+    placeholder_style = "PlaceholderText"
+    for para in root.iter(f"{W}p"):
+        runs = [c for c in para if c.tag == f"{W}r"]
+        if runs and all(
+            (r.find(f"{W}rPr") is not None and
+             r.find(f"{W}rPr").find(f"{W}rStyle") is not None and
+             r.find(f"{W}rPr").find(f"{W}rStyle").get(f"{W}val") == placeholder_style)
+            for r in runs
+        ):
+            xml_snippet = lxml.etree.tostring(para, encoding="unicode")[:300]
+            findings.append({
+                "partUri":       "/word/document.xml",
+                "xPath":         "(see nodeXml)",
+                "description":   "Paragraph contains only PlaceholderText-styled runs "
+                                 '(e.g. "Click or tap here to enter text."). '
+                                 "Template placeholder leaked into output.",
+                "errorType":     "Structural",
+                "severity":      "Medium",
+                "hint":          "Remove this paragraph — it is a content-control default placeholder "
+                                 "that was not cleaned up.",
+                "nodeLocalName": "p",
+                "nodeXml":       xml_snippet,
+            })
+
+    return findings
+
+
+def _check_negative_axids(entries: dict[str, bytes]) -> list[dict]:
+    """Check chart axis ID values for negative numbers (invalid UInt32).
+
+    .NET SDK validates c:axId/@val as UInt32 (minInclusive=0). Python lxml
+    strips c:ext children before XSD validation and misses negative axId values
+    stored directly. This direct scan catches them.
+    """
+    findings: list[dict] = []
+    _CHART_NS = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+    axid_tag  = f"{{{_CHART_NS}}}axId"
+
+    for name, data in entries.items():
+        if not name.endswith(".xml"):
+            continue
+        if "chart" not in name.lower() and "slide" not in name.lower():
+            continue
+        try:
+            root = lxml.etree.fromstring(data)
+        except Exception:
+            continue
+        for el in root.iter(axid_tag):
+            val = el.get("val")
+            if val is None:
+                continue
+            try:
+                if int(val) < 0:
+                    findings.append({
+                        "partUri":       f"/{name}",
+                        "xPath":         f"line:{el.sourceline if hasattr(el, 'sourceline') else '?'}",
+                        "description":   f"The attribute 'val' has invalid value '{val}'. "
+                                         f"The string '{val}' is not a valid 'UInt32' value.",
+                        "errorType":     "InvalidValue",
+                        "severity":      "High",
+                        "hint":          f"Chart axis ID {val} is negative. "
+                                         "UInt32 requires 0–4294967295. "
+                                         "Replace with a unique positive integer (e.g. 1, 2).",
+                        "nodeLocalName": "axId",
+                        "nodeXml":       None,
+                    })
+            except ValueError:
+                pass
     return findings
 
 
@@ -903,8 +1181,9 @@ def validate_file(path: str) -> dict[str, Any]:
         for name, data in entries.items():
             if not name.endswith(".xml") and not name.endswith(".rels"):
                 continue
-            # skip charts in pptx — handled by semantic check
-            if file_type == "pptx" and "charts/" in name and name.endswith(".xml"):
+            # charts: skip XSD (too many ms-extension false-positives);
+            # semantic checks (axis refs, stacked labels) run separately below.
+            if "charts/" in name and name.endswith(".xml") and name.split("/")[-1].startswith("chart"):
                 continue
             # Gap fix #1/#3: skip ms-proprietary and app-custom parts
             if any(p.search(name) for p in _SKIP_PART_PATTERNS):
@@ -934,6 +1213,19 @@ def validate_file(path: str) -> dict[str, Any]:
                     "hint": None, "nodeLocalName": None, "nodeXml": None,
                 })
     result["schemaFindings"] = schema_findings
+
+    # 2b. DOCX custom structural checks (ported from C# ValidateDocx)
+    # These catch issues the XSD schema validator misses but that cause Word's
+    # repair dialog: empty table cells, orphaned bookmarks, placeholder text.
+    if file_type == "docx":
+        result["schemaFindings"].extend(_docx_custom_checks(entries))
+
+    # 2c. Negative axId check (UInt32 minInclusive=0) for pptx/docx charts.
+    # lxml XSD validation strips c:ext children so misses values stored there;
+    # .NET SDK validates the raw SDK object and catches them.
+    if file_type in ("pptx", "docx"):
+        result["schemaFindings"].extend(_check_negative_axids(entries))
+
 
     # 3. PPTX semantic checks
     if file_type == "pptx":
