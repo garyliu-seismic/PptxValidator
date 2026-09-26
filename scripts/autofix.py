@@ -27,7 +27,6 @@ import argparse
 import io
 import json
 import shutil
-import subprocess
 import sys
 import xml.etree.ElementTree as ET
 import zipfile
@@ -56,15 +55,13 @@ def local_name(tag: str) -> str:
 
 
 def run_validate(pptx_path: str) -> dict:
-    proc = subprocess.run(
-        [sys.executable, str(SCRIPT_DIR / "validate.py"), pptx_path, "--json"],
-        capture_output=True,
-        text=True,
-    )
-    if not proc.stdout.strip():
-        raise RuntimeError(f"validate.py produced no output. stderr:\n{proc.stderr}")
-    results = json.loads(proc.stdout)
-    return results[0]
+    """Run validation using the pure-Python backend directly (no subprocess)."""
+    import importlib.util
+    _py_path = SCRIPT_DIR / "py_validate.py"
+    spec = importlib.util.spec_from_file_location("py_validate", _py_path)
+    pv   = importlib.util.module_from_spec(spec)  # type: ignore
+    spec.loader.exec_module(pv)                   # type: ignore
+    return pv.validate_file(pptx_path)
 
 
 def build_parent_map(root: ET.Element) -> dict:

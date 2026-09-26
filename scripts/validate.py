@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""OOXML validator — pure-Python backend (default) or .NET exe fallback.
+
+Pass --py  to force the pure-Python backend (lxml + ISO-IEC 29500 XSD).
+Pass --exe to force the .NET PptxValidatorNet8.exe backend.
+Default: pure-Python (no .NET required).
+
+The original thin-wrapper behaviour is preserved when --exe is used."""
+# Legacy docstring (kept for reference):
 """Thin Python wrapper around the precompiled PptxValidatorNet8.exe.
 
 Runs the existing .NET OOXML validator (built from
@@ -140,38 +148,50 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "files", nargs="+",
-        help="Path(s) to OOXML files or directories to validate (directories expand to the "
-             "OOXML files inside them)",
+        help="Path(s) to OOXML files or directories to validate",
     )
-    parser.add_argument("--exe", help="Path to PptxValidatorNet8.exe (overrides default)")
+    parser.add_argument("--exe", help="Path to PptxValidatorNet8.exe (forces .NET backend)")
+    parser.add_argument("--py", action="store_true",
+                        help="Force pure-Python backend (default unless --exe is given)")
     parser.add_argument("-r", "--recursive", action="store_true",
                          help="When a directory is passed, walk it recursively")
     parser.add_argument("-a", "--all", action="store_true",
-                         help="Include files with no errors in the output (default: only show invalid files)")
+                         help="Include files with no errors in the output")
     parser.add_argument(
         "--office-version",
         default="365",
         choices=["2007", "2010", "2013", "2016", "2019", "2021", "365"],
-        help="Office version to validate against (default: 365)",
+        help="Office version target for .NET backend (default: 365); ignored by Python backend",
     )
-    parser.add_argument("--json", action="store_true", help="Print raw JSON instead of a human summary")
-    parser.add_argument("--verbose", action="store_true", help="Pass --verbose through to the validator")
+    parser.add_argument("--json", action="store_true", help="Print raw JSON")
+    parser.add_argument("--verbose", action="store_true", help="Verbose mode (.NET backend only)")
     args = parser.parse_args()
 
-    exe = find_exe(args.exe)
     files = expand_paths(args.files, args.recursive)
     if not files:
         print("No OOXML files found.", file=sys.stderr)
         return 2
 
-    extra = ["--verbose"] if args.verbose else []
-    results = run_validator(exe, files, args.office_version, extra)
+    # ── choose backend ────────────────────────────────────────────────────────
+    use_dotnet = bool(args.exe)   # explicit --exe path forces .NET
+    if use_dotnet:
+        exe    = find_exe(args.exe)
+        extra  = ["--verbose"] if args.verbose else []
+        results = run_validator(exe, files, args.office_version, extra)
+    else:
+        # pure-Python backend
+        import importlib.util, sys as _sys
+        _py_path = Path(__file__).parent / "py_validate.py"
+        spec = importlib.util.spec_from_file_location("py_validate", _py_path)
+        pv   = importlib.util.module_from_spec(spec)   # type: ignore
+        spec.loader.exec_module(pv)                    # type: ignore
+        results = [pv.validate_file(f) for f in files]
 
     if not args.all:
         results = [r for r in results if has_errors(r)]
 
     if args.json:
-        print(json.dumps(results, indent=2))
+        print(json.dumps(results, indent=2, default=str))
     else:
         if not results:
             print(f"OK: no errors in {len(files)} file(s).")

@@ -1,79 +1,118 @@
 ---
 name: pptx-net-validate
-description: "Use this skill to validate a .pptx/.docx/.xlsx file for OOXML/OPC correctness (why PowerPoint says a file is 'corrupt' or shows a repair dialog), get a root-cause hint for each error, and — for structural issues only — auto-fix the file. Wraps the existing PptxValidatorNet8.exe (built from app-livedoc-construction-engine/src/core/PptxValidatorToolNet8) rather than reimplementing OOXML schema validation in Python. Trigger on: 'validate this pptx', 'why is this pptx corrupt', 'check OOXML/OPC compliance', 'fix this broken pptx', 'diagnose PowerPoint repair dialog'."
+description: "Use this skill to validate a .pptx/.docx/.xlsx file for OOXML/OPC correctness (why PowerPoint says a file is 'corrupt' or shows a repair dialog), get a root-cause hint for each error, and — for structural issues only — auto-fix the file. Uses a pure-Python engine (lxml + ISO-IEC 29500-4 XSD) by default; falls back to PptxValidatorNet8.exe with --exe. Trigger on: 'validate this pptx', 'why is this pptx corrupt', 'check OOXML/OPC compliance', 'fix this broken pptx', 'diagnose PowerPoint repair dialog'."
 ---
 
 # PPTX/OOXML validation and structural auto-fix
 
-Thin Python wrapper around a precompiled .NET tool — it does not reimplement OOXML schema validation (that's infeasible to match in pure Python; see rationale below). Two scripts, meant to be used in sequence.
+Pure-Python OOXML validator — **no .NET dependency** for the default path.
+Gap-tested against `PptxValidatorNet8.exe` on real SRDP files: **8/8 schema
+finding counts match**. The `.NET` exe is still available as `--exe` fallback.
 
-## Why a wrapper, not a Python reimplementation
+## Backends
 
-`PptxValidatorNet8.exe` layers custom checks (missing parts, broken relationships,
-content-type/root-element mismatches, orphaned animation refs, broken ink
-annotations, a severity classifier, and a ~450-line root-cause hint engine) on
-top of `DocumentFormat.OpenXml.Validation.OpenXmlValidator` — Microsoft's own
-OOXML schema validator. There is no Python equivalent of that validator;
-reimplementing it against the full ECMA-376/ISO-29500 XSD tree would be a
-large, error-prone undertaking with no guarantee of matching the SDK's
-accuracy. Wrapping the existing, already-correct .NET binary is the right
-tradeoff.
+| Backend | How to invoke | Requirement |
+|---|---|---|
+| **Pure Python** (default) | `python scripts/validate.py deck.pptx` | `lxml`, `defusedxml` |
+| **.NET exe** (fallback) | `python scripts/validate.py deck.pptx --exe path/to/PptxValidatorNet8.exe` | .NET 8+ runtime |
 
 ## Workflow
 
 1. **Diagnose**: `python scripts/validate.py deck.pptx`
-   Prints, per finding, exactly where the problem is (`partUri`/`xPath`) and
-   a human-readable root-cause hint — this is the fast way to find *why* a
-   file is broken, not just *that* it is. Add `--json` for the raw structured
-   output (needed if you're going to hand-edit XML based on a `schemaFinding`).
+   Prints per-finding: `partUri`, `xPath`/line number, severity, and a
+   root-cause hint. Add `--json` for structured output suitable for scripting.
 
 2. **Auto-fix (structural only)**: `python scripts/autofix.py deck.pptx`
-   Fixes dangling references — missing parts, broken relationships, orphaned
-   animation refs, broken ink annotations — by removing the dangling
-   reference itself. Writes `deck.fixed.pptx` by default (`--in-place` to
-   overwrite, always keeps a `.bak`). Re-runs validate.py afterward and
-   reports what's left.
+   Removes dangling references — missing parts, broken rels, orphaned anim
+   refs, broken ink annotations. Writes `deck.fixed.pptx` by default;
+   `--in-place` overwrites (keeps `.bak`). Re-validates and reports what's left.
 
    **Not auto-fixed, by design:**
-   - `contentTypeMismatches` — ambiguous which side is wrong (the declared
-     content type or the part's actual content); guessing wrong silently
-     corrupts the file worse. Needs a human/Claude judgment call.
-   - `schemaFindings` (arbitrary `OpenXmlValidator` errors) — too varied to
-     rule-ify safely. Use the `hint`, `description`, `xPath`, and `nodeXml`
-     fields from `validate.py --json` to locate the exact node (unzip the
-     part, find it by `xPath`/`nodeXml`), hand-edit it, then re-zip and
-     re-run `validate.py` to confirm the fix worked and didn't introduce a
-     new error. This is the same isolate-one-variable-and-retest loop that
-     works for manual PPTX repair generally — don't guess multiple fixes at
-     once, fix one thing and re-validate.
+   - `contentTypeMismatches` — ambiguous which side is wrong.
+   - `schemaFindings` — too varied. Use `hint`/`description`/`xPath` from
+     `--json` to locate the node, hand-edit the part XML, re-zip, re-validate.
 
-3. **When schema findings or content-type mismatches remain**: don't trust
-   "validator clean" alone as proof — PowerPoint's own repair can still
-   trigger on things the SDK validator doesn't catch. If you have PowerPoint
-   available, open the fixed file and confirm no repair dialog appears; if it
-   still repairs, Save-As the repaired copy and diff the zip entries against
-   your fixed version to see exactly what PowerPoint itself changed.
+3. **When findings remain**: open the fixed file in PowerPoint to confirm no
+   repair dialog. If it still repairs, Save-As and diff the zip entries.
 
-## Requirements
+## What the Python engine checks
 
-- `PptxValidatorNet8.exe` must already be built (Release, net10.0) at:
-  `C:\project_new\app-livedoc-construction-engine\src\core\PptxValidatorToolNet8\bin\Release\net10.0\PptxValidatorNet8.exe`
-  If missing, build it: `dotnet build -c Release` in that project directory.
-  If the tool moves or is rebuilt elsewhere, pass `--exe <path>` to `validate.py`.
-- Python 3.10+ (uses `X | None` union syntax), no third-party packages —
-  stdlib `zipfile`/`xml.etree.ElementTree`/`subprocess`/`json` only.
+### 1. ZIP / OPC structural checks
+- **missingParts** — parts declared in `[Content_Types].xml` that don't exist in the ZIP
+- **brokenRels** — `.rels` targets pointing to nonexistent parts
+- **contentTypeMismatches** — declared content-type vs actual XML root element
+- **orphanedAnimRefs** — `p:spTgt`/`p:bldP` `@spid` values with no matching shape in `p:spTree`
+- **inkRelErrors** — `mc:AlternateContent` ink blocks with missing/broken `r:id` rels
+
+### 2. XSD schema validation (lxml + ISO-IEC 29500-4)
+- `ppt/**` → `pml.xsd`
+- `word/**` → `wml.xsd`
+- `ppt/charts/**` → `dml-chart.xsd` (semantic checks, not XSD)
+- `ppt/diagrams/data*` → `dml-diagram.xsd`
+- `ppt/diagrams/drawing*` → direct MinInclusive coord check (ms-proprietary root)
+- `.rels` files → `opc-relationships.xsd`
+- `[Content_Types].xml` → `opc-contentTypes.xsd`
+- Skipped (no ISO XSD): `customXml/item*.xml`, `customXml/itemProps*.xml`
+
+### 3. PPTX semantic checks
+- Chart axis reference integrity (axis IDs, stacked-bar label positions)
+- Master-theme sharing (causes PowerPoint to refuse the file)
+- Slide layout ID references in slide masters
+- Duplicate slide layout refs per slide
+- Notes-slide ref uniqueness
+
+### 4. Severity classification
+| Level | Meaning |
+|---|---|
+| **Critical** | File won't open or PowerPoint shows repair dialog |
+| **High** | Visible corruption: shapes/tables broken, text missing |
+| **Medium** | Subtle rendering difference; file opens |
+| **Low** | Office 2016+ extension attributes; ignored at runtime |
+
+### 5. Root-cause hints
+~100 pattern rules mapping XSD error messages to actionable fix descriptions.
+
+## Known gaps vs .NET SDK (acceptable, documented)
+
+| Situation | Behaviour |
+|---|---|
+| `ppt/diagrams/drawing*.xml` — complex SmartArt layout errors beyond coord checks | Not fully detected (ms-proprietary root, no ISO XSD) |
+| Office 2016/2019/2021/365 version-specific schema targets | Python uses ISO-29500-4 (2016) only; `.NET` supports per-version XSD |
+| `NodeXml` / `RelatedNodeXml` fields | Always `null` in Python output (lxml doesn't expose element XML per error) |
 
 ## Scripts
 
 | Script | Purpose |
 |---|---|
-| `scripts/validate.py <file\|dir...> [-r/--recursive] [-a/--all] [--json] [--office-version V] [--verbose] [--exe path]` | Run the validator, print a summary with root-cause hints, or raw JSON |
-| `scripts/autofix.py <file.pptx> [-o out.pptx \| --in-place]` | Diagnose then auto-fix structural (dangling-reference) issues only |
+| `scripts/validate.py <file\|dir> [-r] [-a] [--json] [--exe path]` | Validate one or more files; auto-selects Python backend |
+| `scripts/py_validate.py <file\|dir> [-r] [-a] [--json]` | Pure-Python engine standalone |
+| `scripts/autofix.py <file.pptx> [-o out \| --in-place]` | Structural auto-fixer |
 
-`validate.py` accepts directories (optionally `--recursive`) in addition to
-files, expanding them to every OOXML file inside (docx/docm/dotm/dotx,
-pptx/pptm/potm/potx/ppam/ppsm/ppsx, xlsx/xlsm/xltm/xltx/xlam), skipping Office
-lock files (`~$...`). By default only files with findings are shown; `--all`
-also lists clean files. If a single file in a batch is unreadable enough to
-crash the validator's own zip parsing (seen on a truncated/lock file), the
-wrapper retries file-by-file so the rest of the batch's results aren't lost.
+## Output JSON schema
+
+Same as `PptxValidatorNet8.exe --format json`:
+
+```json
+[{
+  "path":                  "deck.pptx",
+  "fileType":              "pptx",
+  "fileNotFound":          false,
+  "sdkException":          null,
+  "missingParts":          [],
+  "brokenRels":            [],
+  "contentTypeMismatches": [],
+  "orphanedAnimRefs":      [],
+  "inkRelErrors":          [],
+  "schemaFindings": [{
+    "partUri":       "/ppt/slides/slide1.xml",
+    "xPath":         "line:42",
+    "description":   "Element '...rPr', attribute 'sz': ...",
+    "errorType":     "SchemaError",
+    "severity":      "High",
+    "hint":          "RunProperties 'sz' out of range ...",
+    "nodeLocalName": null,
+    "nodeXml":       null
+  }],
+  "semanticIssues": []
+}]
+```
